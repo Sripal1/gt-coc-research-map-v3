@@ -1,0 +1,304 @@
+name: Scrape Research Data
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: generate-map-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare scrape chunks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      chunk_count: ${{ steps.split.outputs.chunk_count }}
+      provider: ${{ steps.config.outputs.provider }}
+      api_key_env: ${{ steps.config.outputs.api_key_env }}
+      researchers_file: ${{ steps.config.outputs.researchers_file }}
+      max_threads: ${{ steps.config.outputs.max_threads }}
+      max_requests_per_ip: ${{ steps.config.outputs.max_requests_per_ip }}
+      max_retries: ${{ steps.config.outputs.max_retries }}
+      profiles_dir: ${{ steps.config.outputs.profiles_dir }}
+      output_dir: ${{ steps.config.outputs.output_dir }}
+      chunk_size: ${{ steps.config.outputs.chunk_size }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Wait for config file
+        run: |
+          echo "=== Debug: initial state ==="
+          echo "Files in repo root:"
+          ls -la
+          echo "Git log:"
+          git log --oneline -5
+          echo "==========================="
+          for i in $(seq 1 20); do
+            if [ -f researchmap.config.yaml ]; then
+              echo "Config file found on attempt $i"
+              exit 0
+            fi
+            echo "Config not found (attempt $i/20), fetching latest..."
+            git fetch origin main
+            git reset --hard origin/main
+            sleep 5
+          done
+          echo "ERROR: researchmap.config.yaml not found after 20 attempts"
+          echo "Final files:"
+          ls -la
+          exit 1
+
+      - name: Parse config
+        id: config
+        run: |
+          python3 -c "
+          import re, os
+          config = {}
+          with open('researchmap.config.yaml') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  m = re.match(r'(\w+):\s*\"?([^\"]*)\"?', line)
+                  if m:
+                      config[m.group(1)] = m.group(2).strip()
+          # Map config keys to output names
+          mapping = {
+              'llm_provider': 'provider',
+              'llm_api_key_env': 'api_key_env',
+              'researchers_file': 'researchers_file',
+              'scraper_max_threads': 'max_threads',
+              'scraper_max_requests_per_ip': 'max_requests_per_ip',
+              'scraper_max_retries': 'max_retries',
+              'profiles_dir': 'profiles_dir',
+              'output_dir': 'output_dir',
+              'chunk_size': 'chunk_size',
+          }
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for yaml_key, output_key in mapping.items():
+                  value = config.get(yaml_key, '')
+                  if output_key == 'chunk_size' and not value:
+                      value = '50'
+                  out.write(f'{output_key}={value}\n')
+                  print(f'  {output_key}={value}')
+          "
+
+      - name: Compute chunk matrix
+        id: split
+        run: |
+          RESEARCHERS_FILE="${{ steps.config.outputs.researchers_file }}"
+          CHUNK_SIZE="${{ steps.config.outputs.chunk_size }}"
+          # Count data rows (exclude header)
+          TOTAL=$(tail -n +2 "$RESEARCHERS_FILE" | wc -l | xargs)
+          # Compute number of chunks (ceiling division)
+          CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+          if [ "$CHUNKS" -lt 1 ]; then CHUNKS=1; fi
+          # Build JSON array [0, 1, 2, ...]
+          MATRIX=$(python3 -c "import json; print(json.dumps(list(range($CHUNKS))))")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "chunk_count=$CHUNKS" >> "$GITHUB_OUTPUT"
+          echo "Splitting $TOTAL researchers into $CHUNKS chunks of $CHUNK_SIZE"
+
+  resolve-names:
+    name: Resolve researcher names
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Tor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tor
+          sudo systemctl stop tor || true
+          sudo systemctl disable tor || true
+          sudo killall tor || true
+          sleep 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ScholarMine
+        run: pip install git+https://github.com/Sripal1/scholarmine.git
+
+      - name: Resolve placeholder names
+        run: python pipeline/resolve_names.py "${{ needs.prepare.outputs.researchers_file }}"
+
+      - name: Commit updated researchers
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ needs.prepare.outputs.researchers_file }}"
+          git diff --staged --quiet || git commit -m "Resolve researcher names from Google Scholar"
+          git push
+
+  scrape:
+    name: Scrape chunk ${{ matrix.chunk }}
+    needs: [prepare, resolve-names]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      SCHOLARMINE_RETRY_ATTEMPTS: ${{ vars.SCHOLARMINE_RETRY_ATTEMPTS }}
+    strategy:
+      matrix:
+        chunk: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Tor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tor
+          sudo systemctl stop tor || true
+          sudo systemctl disable tor || true
+          sudo killall tor || true
+          sleep 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ScholarMine
+        run: pip install git+https://github.com/Sripal1/scholarmine.git
+
+      - name: Extract chunk from researchers CSV
+        run: |
+          python3 pipeline/split_csv.py \
+            "${{ needs.prepare.outputs.researchers_file }}" \
+            ${{ matrix.chunk }} \
+            ${{ needs.prepare.outputs.chunk_size }} \
+            chunk_researchers.csv
+
+      - name: Run ScholarMine scraper
+        run: |
+          scholarmine chunk_researchers.csv \
+            --max-threads "${{ needs.prepare.outputs.max_threads }}" \
+            --max-requests-per-ip "${{ needs.prepare.outputs.max_requests_per_ip }}" \
+            --max-retries "${{ needs.prepare.outputs.max_retries }}" \
+            --output-dir "${{ needs.prepare.outputs.profiles_dir }}"
+
+      - name: Retry ScholarMine scraper
+        run: |
+          MAX_ATTEMPTS="${SCHOLARMINE_RETRY_ATTEMPTS:-4}"
+          FAILED_FILE="${{ needs.prepare.outputs.profiles_dir }}/failed_researchers.csv"
+
+          if [ ! -f "$FAILED_FILE" ]; then
+            echo "No failed researchers file found; skipping retry step."
+            exit 0
+          fi
+
+          if ! [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid SCHOLARMINE_RETRY_ATTEMPTS='$MAX_ATTEMPTS'; defaulting to 4"
+            MAX_ATTEMPTS=4
+          fi
+
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "ScholarMine retry attempt ${attempt}/${MAX_ATTEMPTS}"
+            if scholarmine "$FAILED_FILE"; then
+              echo "Retry step succeeded on attempt ${attempt}"
+              break
+            fi
+
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "Retry step failed after ${MAX_ATTEMPTS} attempts"
+              exit 1
+            fi
+
+            echo "Retry step failed on attempt ${attempt}; retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Upload profiles artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: researcher-profiles-${{ matrix.chunk }}
+          path: ${{ needs.prepare.outputs.profiles_dir }}/
+          retention-days: 1
+
+  combine:
+    name: Combine profiles
+    needs: [prepare, scrape]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all profile artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: researcher-profiles-*
+          path: ${{ needs.prepare.outputs.profiles_dir }}/
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Combine profiles into CSV
+        run: |
+          mkdir -p "${{ needs.prepare.outputs.output_dir }}"
+          python pipeline/combine_profiles.py \
+            --input "${{ needs.prepare.outputs.profiles_dir }}" \
+            --output "${{ needs.prepare.outputs.output_dir }}/combined_researcher_papers.csv"
+
+      - name: Upload combined CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-csv
+          path: ${{ needs.prepare.outputs.output_dir }}/combined_researcher_papers.csv
+          retention-days: 1
+
+  persist:
+    name: Persist scrape output
+    needs: [prepare, combine]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Download combined CSV
+        uses: actions/download-artifact@v4
+        with:
+          name: combined-csv
+          path: ${{ needs.prepare.outputs.output_dir }}/
+
+      - name: Download all profile artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: researcher-profiles-*
+          path: ${{ needs.prepare.outputs.profiles_dir }}/
+          merge-multiple: true
+
+      - name: Commit scrape outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ needs.prepare.outputs.profiles_dir }}/" "${{ needs.prepare.outputs.output_dir }}/"
+          git commit -m "Add scraped profiles and combined researcher papers" || echo "No changes to commit"
+          git push

@@ -1,0 +1,97 @@
+name: Deploy Research Map
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: generate-map-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    name: Build & deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Parse config
+        id: config
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          config = {}
+          with open('researchmap.config.yaml') as f:
+            for line in f:
+              line = line.strip()
+              if not line or line.startswith('#'):
+                continue
+              m = re.match(r'(\w+):\s*"?([^"]*)"?', line)
+              if m:
+                config[m.group(1)] = m.group(2).strip()
+
+          repo = os.environ['GITHUB_REPOSITORY'].split('/')[-1]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+            out.write(f"output_dir={config.get('output_dir', 'pipeline-output')}\n")
+            out.write(f"university_name={config.get('university_name', '')}\n")
+            out.write(f"department_name={config.get('department_name', '')}\n")
+            out.write(f"color_theme={config.get('color_theme', '')}\n")
+            out.write(f"base_path=/{repo}/\n")
+          PY
+
+      - name: Copy data to frontend public directory
+        run: |
+          OUTPUT="${{ steps.config.outputs.output_dir }}"
+          # data.ndjson and grid.json → public/data/
+          mkdir -p public/data
+          cp "${OUTPUT}/data.ndjson" public/data/data.ndjson
+          cp "${OUTPUT}/grid.json" public/data/grid.json
+          # Researcher images → public/images/researchers/
+          if [ -d "${OUTPUT}/public/images/researchers" ]; then
+            mkdir -p public/images/researchers
+            cp -r "${OUTPUT}/public/images/researchers/"* public/images/researchers/
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build frontend
+        env:
+          VITE_BASE_PATH: ${{ steps.config.outputs.base_path }}
+          VITE_UNIVERSITY_NAME: ${{ steps.config.outputs.university_name }}
+          VITE_DEPARTMENT_NAME: ${{ steps.config.outputs.department_name }}
+          VITE_COLOR_THEME: ${{ steps.config.outputs.color_theme }}
+        run: npm run build:actions
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

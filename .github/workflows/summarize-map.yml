@@ -1,0 +1,204 @@
+name: Generate Research Summaries
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: generate-map-summarize
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare summary chunks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      chunk_count: ${{ steps.split.outputs.chunk_count }}
+      provider: ${{ steps.config.outputs.provider }}
+      api_key_env: ${{ steps.config.outputs.api_key_env }}
+      output_dir: ${{ steps.config.outputs.output_dir }}
+      chunk_size: ${{ steps.config.outputs.chunk_size }}
+      summary_max_parallel: ${{ steps.config.outputs.summary_max_parallel }}
+      summary_retries: ${{ steps.config.outputs.summary_retries }}
+      summary_rate_delay: ${{ steps.config.outputs.summary_rate_delay }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Parse config
+        id: config
+        run: |
+          python3 - <<'PY'
+          import re, os
+
+          config = {}
+          with open('researchmap.config.yaml') as f:
+            for line in f:
+              line = line.strip()
+              if not line or line.startswith('#'):
+                continue
+              m = re.match(r'(\w+):\s*"?([^"]*)"?', line)
+              if m:
+                config[m.group(1)] = m.group(2).strip()
+
+          def int_config(name, default, minimum=1):
+            raw = config.get(name, '')
+            try:
+              value = int(raw)
+            except (TypeError, ValueError):
+              value = default
+            return max(minimum, value)
+
+          def float_config(name, default, minimum=0.0):
+            raw = config.get(name, '')
+            try:
+              value = float(raw)
+            except (TypeError, ValueError):
+              value = default
+            return max(minimum, value)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+            out.write(f"provider={config.get('llm_provider', '')}\n")
+            out.write(f"output_dir={config.get('output_dir', 'pipeline-output')}\n")
+            out.write(f"chunk_size={config.get('chunk_size', '50')}\n")
+            out.write(f"summary_max_parallel={int_config('summary_max_parallel', 2)}\n")
+            out.write(f"summary_retries={int_config('summary_retries', 3)}\n")
+            out.write(f"summary_rate_delay={float_config('summary_rate_delay', 4.0)}\n")
+          PY
+
+      - name: Compute chunk matrix
+        id: split
+        run: |
+          OUTPUT_DIR="${{ steps.config.outputs.output_dir }}"
+          CHUNK_SIZE="${{ steps.config.outputs.chunk_size }}"
+          CSV_FILE="${OUTPUT_DIR}/combined_researcher_papers.csv"
+          
+          if [ ! -f "$CSV_FILE" ]; then
+            echo "ERROR: combined_researcher_papers.csv not found at $CSV_FILE"
+            echo "Please run the scrape workflow first to generate this file."
+            exit 1
+          fi
+          
+          # Count unique researchers (by google_scholar_id), not paper rows
+          TOTAL=$(tail -n +2 "$CSV_FILE" | cut -d',' -f3 | sort -u | wc -l | xargs)
+          # Compute number of chunks (ceiling division)
+          CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+          if [ "$CHUNKS" -lt 1 ]; then CHUNKS=1; fi
+          # Build JSON array [0, 1, 2, ...]
+          MATRIX=$(python3 -c "import json; print(json.dumps(list(range($CHUNKS))))")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "chunk_count=$CHUNKS" >> "$GITHUB_OUTPUT"
+          echo "Splitting $TOTAL researchers into $CHUNKS chunks of $CHUNK_SIZE"
+
+  validate-key:
+    name: Validate LLM API key
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate configured LLM key
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python pipeline/generate_summaries.py \
+            --provider "${{ needs.prepare.outputs.provider }}" \
+            --validate-only
+
+  summarize:
+    name: Generate summaries chunk ${{ matrix.chunk }}
+    needs: [prepare, validate-key]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      max-parallel: ${{ fromJson(needs.prepare.outputs.summary_max_parallel) }}
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pipeline dependencies
+        run: pip install -r pipeline/requirements.txt
+
+      - name: Generate summaries for chunk
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python pipeline/generate_summaries.py \
+            --input "${{ needs.prepare.outputs.output_dir }}/combined_researcher_papers.csv" \
+            --output "${{ needs.prepare.outputs.output_dir }}/enriched_researcher_papers.csv" \
+            --provider "${{ needs.prepare.outputs.provider }}" \
+            --chunk-index ${{ matrix.chunk }} \
+            --total-chunks ${{ needs.prepare.outputs.chunk_count }} \
+            --rate-delay "${{ needs.prepare.outputs.summary_rate_delay }}" \
+            --researcher-retries "${{ needs.prepare.outputs.summary_retries }}" \
+            --resume
+
+      - name: Upload summary progress
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-progress-${{ matrix.chunk }}
+          path: ${{ needs.prepare.outputs.output_dir }}/summaries_progress_${{ matrix.chunk }}.json
+          retention-days: 1
+          if-no-files-found: warn
+
+  persist:
+    name: Persist summary output
+    needs: [prepare, summarize]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Download all summary progress artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: summary-progress-*
+          path: ${{ needs.prepare.outputs.output_dir }}/
+          merge-multiple: true
+
+      - name: Commit summary outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          OUTPUT_DIR="${{ needs.prepare.outputs.output_dir }}"
+          find "$OUTPUT_DIR" -maxdepth 1 -type f \( -name 'summaries_progress_*.json' -o -name 'enriched_researcher_papers.csv' \) -print0 | xargs -0 -r git add --
+          git commit -m "Add researcher summaries and enriched paper data" || echo "No changes to commit"
+          git push
+
+      - name: Keep workflow failed until all summaries succeed
+        if: ${{ needs.summarize.result != 'success' }}
+        run: |
+          echo "One or more summary chunks failed. Progress was persisted; rerun failed jobs to retry only incomplete researchers."
+          exit 1

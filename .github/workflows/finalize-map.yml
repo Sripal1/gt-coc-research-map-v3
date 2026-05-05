@@ -1,0 +1,82 @@
+name: Finalize Research Map Data
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: generate-map-finalize
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    name: Finalize pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Parse config
+        id: config
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          config = {}
+          with open('researchmap.config.yaml') as f:
+            for line in f:
+              line = line.strip()
+              if not line or line.startswith('#'):
+                continue
+              m = re.match(r'(\w+):\s*"?([^"]*)"?', line)
+              if m:
+                config[m.group(1)] = m.group(2).strip()
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+            out.write(f"profiles_dir={config.get('profiles_dir', 'researcher-profiles')}\n")
+            out.write(f"output_dir={config.get('output_dir', 'pipeline-output')}\n")
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pipeline dependencies
+        run: pip install -r pipeline/requirements.txt
+
+      - name: Merge summaries
+        run: |
+          python pipeline/merge_summaries.py \
+            --input "${{ steps.config.outputs.output_dir }}/combined_researcher_papers.csv" \
+            --output "${{ steps.config.outputs.output_dir }}/enriched_researcher_papers.csv" \
+            --progress-dir "${{ steps.config.outputs.output_dir }}"
+
+      - name: Generate map data
+        run: |
+          python pipeline/generate_map_data.py \
+            --input "${{ steps.config.outputs.output_dir }}/enriched_researcher_papers.csv" \
+            --output-dir "${{ steps.config.outputs.output_dir }}"
+
+      - name: Download researcher images
+        run: |
+          python pipeline/download_images.py \
+            --input "${{ steps.config.outputs.output_dir }}/enriched_researcher_papers.csv" \
+            --output-dir "${{ steps.config.outputs.output_dir }}/public/images/researchers"
+
+      - name: Commit finalize output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.config.outputs.output_dir }}/"
+          git commit -m "Generate map data and researcher images" || echo "No changes to commit"
+          git push

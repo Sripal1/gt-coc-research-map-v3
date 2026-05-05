@@ -1,0 +1,10 @@
+numpy
+pandas
+torch
+transformers
+umap-learn
+scikit-learn
+scipy
+quadtreed3
+ndjson
+requests

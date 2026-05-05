@@ -1,0 +1,12 @@
+llm_provider: openai
+llm_api_key_env: OPENAI_API_KEY
+researchers_file: data/researchers.csv
+scraper_max_threads: 8
+scraper_max_requests_per_ip: 3
+scraper_max_retries: 3
+profiles_dir: researcher-profiles
+output_dir: pipeline-output
+chunk_size: 50
+university_name: "AI Map"
+department_name: "Research"
+color_theme: "#4f46e5"
