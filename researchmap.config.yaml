@@ -1,12 +1,22 @@
-llm_provider: openai
-llm_api_key_env: OPENAI_API_KEY
-researchers_file: data/researchers.csv
-scraper_max_threads: 8
-scraper_max_requests_per_ip: 3
-scraper_max_retries: 3
-profiles_dir: researcher-profiles
-output_dir: pipeline-output
+# University / department metadata
+university_name: "gt"
+department_name: "coc"
+color_theme: "#2a7a72"
+
+# LLM configuration
+llm_provider: "gemini"
+llm_api_key_env: "GEMINI_API_KEY"
+
+# Scraper settings
+researchers_file: "researchers.csv"
+scraper_max_threads: 10
+scraper_max_requests_per_ip: 10
+scraper_max_retries: 10
 chunk_size: 50
-university_name: "AI Map"
-department_name: "Research"
-color_theme: "#4f46e5"
+summary_max_parallel: 2
+summary_retries: 3
+summary_rate_delay: 4
+
+# Pipeline settings
+profiles_dir: "Researcher_Profiles"
+output_dir: "pipeline-output"
